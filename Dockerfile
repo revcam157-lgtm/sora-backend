@@ -1,7 +1,6 @@
 FROM node:18-slim
 
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     python3 \
     python3-pip \
     curl \
@@ -14,9 +13,6 @@ WORKDIR /app
 COPY package.json .
 RUN npm install
 COPY server.js .
-
-# Cria /tmp/sorawipe com permissões totais
-RUN mkdir -p /tmp/sorawipe/output /tmp/sorawipe/uploads && chmod -R 777 /tmp/sorawipe
 
 EXPOSE 8080
 CMD ["node", "server.js"]
