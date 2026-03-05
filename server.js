@@ -44,6 +44,8 @@ function extractMp4FromJson(json) {
     json?.data?.video_url,
     json?.data?.download_links?.mp4_source,
     json?.data?.download_links?.mp4,
+    json?.generations?.[0]?.video_url,
+    json?.generation?.video_url,
   ];
   for (const c of candidates) {
     if (c && typeof c === 'string' && c.startsWith('http')) return c;
@@ -84,32 +86,43 @@ app.post('/process', async (req, res) => {
 
     if (SORA_COOKIES_ENV) {
       await context.addCookies(parseCookies(SORA_COOKIES_ENV));
-      console.log('🍪 Cookies injetados');
     }
 
-    // Injeta Bearer token em todas as requisições
-    if (SORA_AUTH_TOKEN) {
-      await context.route('**/*', async (route) => {
+    // Injeta Bearer em todas requisições API
+    await context.route('**/*', async (route) => {
+      const reqUrl = route.request().url();
+      if (reqUrl.includes('sora.chatgpt.com') || reqUrl.includes('openai.com')) {
         const headers = {
           ...route.request().headers(),
           'authorization': `Bearer ${SORA_AUTH_TOKEN}`,
         };
         await route.continue({ headers });
-      });
-      console.log('🔑 Bearer token injetado');
-    }
+      } else {
+        await route.continue();
+      }
+    });
 
     let mp4Url = null;
+    const allApiCalls = [];
 
+    // Loga TODAS as chamadas de API para descobrir o endpoint correto
     context.on('response', async (response) => {
       const respUrl = response.url();
-      if (respUrl.includes('/backend-api/') && !mp4Url) {
+      const status = response.status();
+      const contentType = response.headers()['content-type'] || '';
+
+      if (respUrl.includes('sora.chatgpt.com') && contentType.includes('application/json')) {
         try {
           const json = await response.json();
+          const preview = JSON.stringify(json).substring(0, 200);
+          allApiCalls.push(`[${status}] ${respUrl} => ${preview}`);
+          console.log(`📡 API: [${status}] ${respUrl}`);
+          console.log(`   Data: ${preview}`);
+
           const found = extractMp4FromJson(json);
-          if (found) {
+          if (found && !mp4Url) {
             mp4Url = found;
-            console.log('✅ MP4 interceptado via network');
+            console.log('✅ MP4 encontrado!', mp4Url.substring(0, 80));
           }
         } catch(e) {}
       }
@@ -123,42 +136,18 @@ app.post('/process', async (req, res) => {
 
     console.log('🌐 Abrindo página...');
     await page.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(6000);
 
-    // Tenta fetch direto com Bearer token
-    if (!mp4Url) {
-      console.log('🔍 Tentando fetch direto...');
-      const result = await page.evaluate(async (params) => {
-        try {
-          const r = await fetch(`/backend-api/video/generation/${params.id}`, {
-            credentials: 'include',
-            headers: {
-              'Accept': 'application/json',
-              'Authorization': `Bearer ${params.token}`
-            }
-          });
-          const text = await r.text();
-          console.log('Status:', r.status, 'Response:', text.substring(0, 200));
-          return { status: r.status, text };
-        } catch(e) {
-          return { error: e.message };
-        }
-      }, { id: videoId, token: SORA_AUTH_TOKEN });
-
-      console.log('Fetch result:', JSON.stringify(result).substring(0, 300));
-
-      if (result?.text) {
-        try {
-          const json = JSON.parse(result.text);
-          mp4Url = extractMp4FromJson(json);
-        } catch(e) {}
-      }
-    }
+    console.log(`📊 Total API calls capturadas: ${allApiCalls.length}`);
 
     await browser.close();
 
     if (!mp4Url) {
-      return res.status(500).json({ error: 'Não foi possível extrair o vídeo. Token pode ter expirado.' });
+      return res.status(500).json({
+        error: 'MP4 não encontrado.',
+        api_calls_found: allApiCalls.length,
+        calls: allApiCalls.slice(0, 5)
+      });
     }
 
     res.json({ downloadUrl: mp4Url });
