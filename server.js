@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const { execFile } = require('child_process');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -10,33 +11,59 @@ app.use(express.json({ limit: '10mb' }));
 
 app.get('/', (req, res) => res.json({ status: '✅ Sora Downloader online' }));
 
-// Extrai URL direta do MP4 limpo usando yt-dlp
-function extractVideoUrl(pageUrl) {
+// Faz fetch da página HTML do Sora e extrai URL do MP4 limpo
+function fetchPage(url) {
   return new Promise((resolve, reject) => {
-    const args = [
-      '--no-playlist',
-      '--no-warnings',
-      '--get-url',                    // só retorna a URL direta, não baixa
-      '--impersonate', 'chrome',
-      pageUrl
-    ];
-
-    execFile('yt-dlp', args, { timeout: 30000 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(stderr || error.message));
-      } else {
-        const url = stdout.trim().split('\n')[0]; // pega primeira URL
-        if (!url || !url.startsWith('http')) {
-          reject(new Error('Não foi possível extrair a URL do vídeo.'));
-        } else {
-          resolve(url);
-        }
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Cache-Control': 'no-cache',
       }
+    }, (res) => {
+      // Seguir redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchPage(res.headers.location).then(resolve).catch(reject);
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
     });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
-// POST /process — recebe link da página do Sora, retorna URL direta do mp4
+function extractVideoUrl(html) {
+  // Padrões para encontrar URL do MP4 no HTML/JSON do Sora
+  const patterns = [
+    // JSON embed com URL de vídeo
+    /"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"/i,
+    /"videoUrl"\s*:\s*"([^"]+\.mp4[^"]*)"/i,
+    /"url"\s*:\s*"(https?:\/\/[^"]+\.mp4[^"]*)"/i,
+    // Tags de vídeo HTML
+    /<source[^>]+src="([^"]+\.mp4[^"]*)"[^>]*>/i,
+    /<video[^>]+src="([^"]+\.mp4[^"]*)"[^>]*>/i,
+    // URLs CDN comuns da OpenAI
+    /(https?:\/\/(?:cdn\.openai\.com|videos\.openai\.com|sora\.com)[^\s"'<>]+\.mp4[^\s"'<>]*)/i,
+    // Qualquer mp4 em JSON
+    /(https?:\/\/[^\s"'<>]+\.mp4(?:\?[^\s"'<>]*)?)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      // Decodifica escapes unicode/JSON
+      let url = match[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\"/g, '"');
+      if (url.startsWith('http')) return url;
+    }
+  }
+  return null;
+}
+
+// POST /process
 app.post('/process', async (req, res) => {
   const { url } = req.body;
 
@@ -45,10 +72,24 @@ app.post('/process', async (req, res) => {
   }
 
   try {
-    console.log('🔍 Extraindo URL do vídeo:', url);
-    const directUrl = await extractVideoUrl(url);
-    console.log('✅ URL extraída:', directUrl);
-    res.json({ downloadUrl: directUrl });
+    console.log('🔍 Buscando página:', url);
+    const html = await fetchPage(url);
+
+    console.log('📄 HTML recebido, tamanho:', html.length);
+
+    const videoUrl = extractVideoUrl(html);
+
+    if (!videoUrl) {
+      // Log parte do HTML para debug
+      console.log('HTML preview:', html.substring(0, 2000));
+      return res.status(500).json({ 
+        error: 'Não foi possível extrair o vídeo. O link precisa ser público e de um vídeo publicado no Sora.' 
+      });
+    }
+
+    console.log('✅ URL do vídeo encontrada:', videoUrl);
+    res.json({ downloadUrl: videoUrl });
+
   } catch (err) {
     console.error('❌', err.message);
     res.status(500).json({ error: err.message });
