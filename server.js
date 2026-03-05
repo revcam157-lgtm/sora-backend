@@ -33,32 +33,30 @@ function extractId(url) {
   return m ? m[1] : null;
 }
 
-function extractMp4FromJson(json) {
-  const str = JSON.stringify(json);
-  const candidates = [
-    json?.download_links?.mp4_source,
-    json?.download_links?.mp4,
-    json?.video_url,
-    json?.source_url,
-    json?.url,
-    json?.data?.video_url,
-    json?.data?.download_links?.mp4_source,
-    json?.data?.download_links?.mp4,
-    json?.generations?.[0]?.video_url,
-    json?.generation?.video_url,
+function extractMp4FromAny(data) {
+  const str = typeof data === 'string' ? data : JSON.stringify(data);
+  // Busca qualquer URL de vídeo
+  const patterns = [
+    /"(https?:\/\/[^"]+\.mp4[^"]*)"/,
+    /"video_url"\s*:\s*"([^"]+)"/,
+    /"source_url"\s*:\s*"([^"]+)"/,
+    /"download_url"\s*:\s*"([^"]+)"/,
+    /"url"\s*:\s*"(https?:\/\/[^"]+(?:mp4|video)[^"]*)"/,
   ];
-  for (const c of candidates) {
-    if (c && typeof c === 'string' && c.startsWith('http')) return c;
+  for (const p of patterns) {
+    const m = str.match(p);
+    if (m) {
+      const url = m[1].replace(/\\\//g, '/').replace(/\\u002F/g, '/');
+      if (url.startsWith('http')) return url;
+    }
   }
-  const match = str.match(/"(https?:\/\/[^"]+\.mp4[^"]*)"/);
-  if (match) return match[1].replace(/\\\//g, '/');
   return null;
 }
 
 app.get('/', (req, res) => res.json({
-  status: '✅ Sora Downloader online',
-  auth: SORA_AUTH_TOKEN ? 'configurado' : 'não configurado',
-  cookies: SORA_COOKIES_ENV ? 'configurado' : 'não configurado'
+  status: '✅ online',
+  auth: !!SORA_AUTH_TOKEN,
+  cookies: !!SORA_COOKIES_ENV
 }));
 
 app.post('/process', async (req, res) => {
@@ -86,16 +84,15 @@ app.post('/process', async (req, res) => {
 
     if (SORA_COOKIES_ENV) {
       await context.addCookies(parseCookies(SORA_COOKIES_ENV));
+      console.log('🍪 Cookies injetados');
     }
 
-    // Injeta Bearer em todas requisições API
+    // Injeta Bearer em requisições ao sora
     await context.route('**/*', async (route) => {
       const reqUrl = route.request().url();
       if (reqUrl.includes('sora.chatgpt.com') || reqUrl.includes('openai.com')) {
-        const headers = {
-          ...route.request().headers(),
-          'authorization': `Bearer ${SORA_AUTH_TOKEN}`,
-        };
+        const headers = { ...route.request().headers() };
+        if (SORA_AUTH_TOKEN) headers['authorization'] = `Bearer ${SORA_AUTH_TOKEN}`;
         await route.continue({ headers });
       } else {
         await route.continue();
@@ -103,26 +100,24 @@ app.post('/process', async (req, res) => {
     });
 
     let mp4Url = null;
-    const allApiCalls = [];
+    const allResponses = [];
 
-    // Loga TODAS as chamadas de API para descobrir o endpoint correto
+    // Intercepta TODAS as respostas JSON
     context.on('response', async (response) => {
       const respUrl = response.url();
+      const ct = response.headers()['content-type'] || '';
       const status = response.status();
-      const contentType = response.headers()['content-type'] || '';
 
-      if (respUrl.includes('sora.chatgpt.com') && contentType.includes('application/json')) {
+      if (ct.includes('json') || respUrl.includes('backend')) {
         try {
-          const json = await response.json();
-          const preview = JSON.stringify(json).substring(0, 200);
-          allApiCalls.push(`[${status}] ${respUrl} => ${preview}`);
-          console.log(`📡 API: [${status}] ${respUrl}`);
-          console.log(`   Data: ${preview}`);
+          const text = await response.text();
+          allResponses.push(`[${status}] ${respUrl}\n    => ${text.substring(0, 400)}`);
+          console.log(`📡 [${status}] ${respUrl}`);
+          console.log(`   => ${text.substring(0, 300)}`);
 
-          const found = extractMp4FromJson(json);
-          if (found && !mp4Url) {
-            mp4Url = found;
-            console.log('✅ MP4 encontrado!', mp4Url.substring(0, 80));
+          if (!mp4Url) {
+            mp4Url = extractMp4FromAny(text);
+            if (mp4Url) console.log('✅ MP4 encontrado!', mp4Url.substring(0, 80));
           }
         } catch(e) {}
       }
@@ -134,19 +129,70 @@ app.post('/process', async (req, res) => {
       window.chrome = { runtime: {} };
     });
 
-    console.log('🌐 Abrindo página...');
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
-    await page.waitForTimeout(6000);
+    console.log('🌐 Navegando para:', url);
+    try {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    } catch(e) {
+      console.log('⚠️ timeout no goto, continuando...');
+    }
 
-    console.log(`📊 Total API calls capturadas: ${allApiCalls.length}`);
+    // Aguarda mais para carregar
+    await page.waitForTimeout(8000);
+
+    // Verifica se está logado
+    const bodyText = await page.evaluate(() => document.body?.innerText || '');
+    const loggedIn = !bodyText.includes('Log in') && !bodyText.includes('Sign in') && bodyText.length > 100;
+    console.log('👤 Logado:', loggedIn);
+    console.log('📊 Total respostas capturadas:', allResponses.length);
+
+    // Tenta chamar diretamente os endpoints conhecidos do Sora
+    if (!mp4Url) {
+      console.log('🔍 Tentando endpoints diretos...');
+
+      const endpoints = [
+        `/backend-api/video/generation/${videoId}`,
+        `/backend/video/generation/${videoId}`,
+        `/backend-api/generations/${videoId}`,
+        `/backend/generations/${videoId}`,
+        `/backend-api/videos/${videoId}`,
+        `/api/video/${videoId}`,
+      ];
+
+      for (const endpoint of endpoints) {
+        const result = await page.evaluate(async (params) => {
+          try {
+            const r = await fetch(params.endpoint, {
+              credentials: 'include',
+              headers: {
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${params.token}`
+              }
+            });
+            return { status: r.status, text: await r.text() };
+          } catch(e) { return { error: e.message }; }
+        }, { endpoint, token: SORA_AUTH_TOKEN });
+
+        console.log(`  ${endpoint} => [${result.status}] ${(result.text||'').substring(0, 200)}`);
+
+        if (result.status === 200 && result.text) {
+          const found = extractMp4FromAny(result.text);
+          if (found) {
+            mp4Url = found;
+            console.log('✅ MP4 via endpoint direto!');
+            break;
+          }
+        }
+      }
+    }
 
     await browser.close();
 
     if (!mp4Url) {
       return res.status(500).json({
         error: 'MP4 não encontrado.',
-        api_calls_found: allApiCalls.length,
-        calls: allApiCalls.slice(0, 5)
+        logged_in: loggedIn,
+        api_responses: allResponses.length,
+        debug: allResponses.slice(0, 3)
       });
     }
 
