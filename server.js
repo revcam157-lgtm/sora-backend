@@ -13,19 +13,30 @@ const SORA_AUTH_TOKEN = process.env.SORA_AUTH_TOKEN || '';
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Parser inteligente de cookies — lida com valores que contêm "="
 function parseCookies(cookieStr) {
-  return cookieStr.split(';').map(c => {
-    const [name, ...rest] = c.trim().split('=');
-    return {
-      name: name.trim(),
-      value: rest.join('=').trim(),
-      domain: 'sora.chatgpt.com',
-      path: '/',
-      secure: true,
-      httpOnly: false,
-      sameSite: 'Lax',
-    };
-  }).filter(c => c.name && c.value);
+  const cookies = [];
+  // Split apenas por "; " (ponto e vírgula + espaço) para não quebrar valores base64
+  const parts = cookieStr.split(/;\s+/);
+  for (const part of parts) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const name = part.substring(0, idx).trim();
+    const value = part.substring(idx + 1).trim();
+    if (!name || !value) continue;
+
+    // Adiciona para ambos os domínios
+    for (const domain of ['sora.chatgpt.com', '.chatgpt.com']) {
+      cookies.push({
+        name, value, domain,
+        path: '/',
+        secure: true,
+        httpOnly: name.includes('session') || name.includes('auth'),
+        sameSite: 'Lax',
+      });
+    }
+  }
+  return cookies;
 }
 
 function extractId(url) {
@@ -33,21 +44,27 @@ function extractId(url) {
   return m ? m[1] : null;
 }
 
-function extractMp4FromAny(data) {
-  const str = typeof data === 'string' ? data : JSON.stringify(data);
-  // Busca qualquer URL de vídeo
+function extractMp4FromText(text, videoId) {
+  // Ignora URLs que não têm relação com o vídeo solicitado
+  const str = typeof text === 'string' ? text : JSON.stringify(text);
+  
+  // Procura por URLs que contenham o ID do vídeo ou CDN de vídeos gerados
   const patterns = [
-    /"(https?:\/\/[^"]+\.mp4[^"]*)"/,
-    /"video_url"\s*:\s*"([^"]+)"/,
-    /"source_url"\s*:\s*"([^"]+)"/,
-    /"download_url"\s*:\s*"([^"]+)"/,
-    /"url"\s*:\s*"(https?:\/\/[^"]+(?:mp4|video)[^"]*)"/,
+    new RegExp(`"(https?://[^"]*${videoId}[^"]*)"`, 'i'),
+    /"(https?:\/\/(?:cdn|video|videos|storage)[^"]+\.mp4[^"]*)"/i,
+    /"video_url"\s*:\s*"([^"]+)"/i,
+    /"source_url"\s*:\s*"([^"]+)"/i,
+    /"download_url"\s*:\s*"([^"]+)"/i,
   ];
+
   for (const p of patterns) {
     const m = str.match(p);
     if (m) {
       const url = m[1].replace(/\\\//g, '/').replace(/\\u002F/g, '/');
-      if (url.startsWith('http')) return url;
+      // Ignora o vídeo de tutorial da OpenAI
+      if (url.startsWith('http') && !url.includes('nux.') && !url.includes('deep-research')) {
+        return url;
+      }
     }
   }
   return null;
@@ -56,7 +73,8 @@ function extractMp4FromAny(data) {
 app.get('/', (req, res) => res.json({
   status: '✅ online',
   auth: !!SORA_AUTH_TOKEN,
-  cookies: !!SORA_COOKIES_ENV
+  cookies: !!SORA_COOKIES_ENV,
+  cookies_count: SORA_COOKIES_ENV ? parseCookies(SORA_COOKIES_ENV).length : 0
 }));
 
 app.post('/process', async (req, res) => {
@@ -64,7 +82,7 @@ app.post('/process', async (req, res) => {
   if (!url || !url.startsWith('http')) return res.status(400).json({ error: 'URL inválido.' });
 
   const videoId = extractId(url);
-  if (!videoId) return res.status(400).json({ error: 'ID do vídeo não encontrado.' });
+  if (!videoId) return res.status(400).json({ error: 'ID não encontrado.' });
 
   console.log('🎬 Buscando:', videoId);
 
@@ -83,41 +101,46 @@ app.post('/process', async (req, res) => {
     });
 
     if (SORA_COOKIES_ENV) {
-      await context.addCookies(parseCookies(SORA_COOKIES_ENV));
-      console.log('🍪 Cookies injetados');
+      const cookies = parseCookies(SORA_COOKIES_ENV);
+      await context.addCookies(cookies);
+      console.log(`🍪 ${cookies.length} cookies injetados`);
+      // Log dos nomes dos cookies para debug
+      console.log('Cookies:', cookies.map(c => c.name).join(', '));
     }
 
     // Injeta Bearer em requisições ao sora
-    await context.route('**/*', async (route) => {
-      const reqUrl = route.request().url();
-      if (reqUrl.includes('sora.chatgpt.com') || reqUrl.includes('openai.com')) {
-        const headers = { ...route.request().headers() };
-        if (SORA_AUTH_TOKEN) headers['authorization'] = `Bearer ${SORA_AUTH_TOKEN}`;
-        await route.continue({ headers });
-      } else {
-        await route.continue();
-      }
-    });
+    if (SORA_AUTH_TOKEN) {
+      await context.route('**/*', async (route) => {
+        const reqUrl = route.request().url();
+        if (reqUrl.includes('sora.chatgpt.com') || reqUrl.includes('openai.com')) {
+          const headers = { ...route.request().headers(), 'authorization': `Bearer ${SORA_AUTH_TOKEN}` };
+          await route.continue({ headers });
+        } else {
+          await route.continue();
+        }
+      });
+      console.log('🔑 Bearer injetado');
+    }
 
     let mp4Url = null;
-    const allResponses = [];
 
-    // Intercepta TODAS as respostas JSON
     context.on('response', async (response) => {
       const respUrl = response.url();
       const ct = response.headers()['content-type'] || '';
       const status = response.status();
 
-      if (ct.includes('json') || respUrl.includes('backend')) {
+      if ((ct.includes('json') || respUrl.includes('backend') || respUrl.includes('sora.chatgpt')) && !respUrl.includes('ab.chatgpt')) {
         try {
           const text = await response.text();
-          allResponses.push(`[${status}] ${respUrl}\n    => ${text.substring(0, 400)}`);
           console.log(`📡 [${status}] ${respUrl}`);
-          console.log(`   => ${text.substring(0, 300)}`);
+          console.log(`   => ${text.substring(0, 400)}`);
 
           if (!mp4Url) {
-            mp4Url = extractMp4FromAny(text);
-            if (mp4Url) console.log('✅ MP4 encontrado!', mp4Url.substring(0, 80));
+            const found = extractMp4FromText(text, videoId);
+            if (found) {
+              mp4Url = found;
+              console.log('✅ MP4 correto encontrado!', mp4Url.substring(0, 100));
+            }
           }
         } catch(e) {}
       }
@@ -129,58 +152,49 @@ app.post('/process', async (req, res) => {
       window.chrome = { runtime: {} };
     });
 
-    console.log('🌐 Navegando para:', url);
+    console.log('🌐 Navegando...');
     try {
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     } catch(e) {
-      console.log('⚠️ timeout no goto, continuando...');
+      console.log('⚠️ timeout, continuando...');
     }
-
-    // Aguarda mais para carregar
     await page.waitForTimeout(8000);
 
-    // Verifica se está logado
-    const bodyText = await page.evaluate(() => document.body?.innerText || '');
-    const loggedIn = !bodyText.includes('Log in') && !bodyText.includes('Sign in') && bodyText.length > 100;
-    console.log('👤 Logado:', loggedIn);
-    console.log('📊 Total respostas capturadas:', allResponses.length);
+    // Verifica autenticação
+    const authCheck = await page.evaluate(async (token) => {
+      try {
+        const r = await fetch('/api/auth/session', { credentials: 'include' });
+        return await r.text();
+      } catch(e) { return e.message; }
+    }, SORA_AUTH_TOKEN);
+    console.log('🔐 Auth session:', authCheck.substring(0, 200));
 
-    // Tenta chamar diretamente os endpoints conhecidos do Sora
+    // Tenta endpoints diretos se ainda não achou
     if (!mp4Url) {
       console.log('🔍 Tentando endpoints diretos...');
-
       const endpoints = [
-        `/backend-api/video/generation/${videoId}`,
-        `/backend/video/generation/${videoId}`,
-        `/backend-api/generations/${videoId}`,
         `/backend/generations/${videoId}`,
-        `/backend-api/videos/${videoId}`,
-        `/api/video/${videoId}`,
+        `/backend-api/video/generation/${videoId}`,
+        `/backend/video/${videoId}`,
+        `/backend/videos/${videoId}`,
       ];
 
-      for (const endpoint of endpoints) {
-        const result = await page.evaluate(async (params) => {
+      for (const ep of endpoints) {
+        const r = await page.evaluate(async (params) => {
           try {
-            const r = await fetch(params.endpoint, {
+            const resp = await fetch(params.ep, {
               credentials: 'include',
-              headers: {
-                'Accept': 'application/json',
-                'Authorization': `Bearer ${params.token}`
-              }
+              headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${params.token}` }
             });
-            return { status: r.status, text: await r.text() };
+            return { status: resp.status, text: await resp.text() };
           } catch(e) { return { error: e.message }; }
-        }, { endpoint, token: SORA_AUTH_TOKEN });
+        }, { ep, token: SORA_AUTH_TOKEN });
 
-        console.log(`  ${endpoint} => [${result.status}] ${(result.text||'').substring(0, 200)}`);
+        console.log(`  ${ep} [${r.status}]: ${(r.text||'').substring(0, 200)}`);
 
-        if (result.status === 200 && result.text) {
-          const found = extractMp4FromAny(result.text);
-          if (found) {
-            mp4Url = found;
-            console.log('✅ MP4 via endpoint direto!');
-            break;
-          }
+        if (r.status === 200 && r.text) {
+          const found = extractMp4FromText(r.text, videoId);
+          if (found) { mp4Url = found; break; }
         }
       }
     }
@@ -188,12 +202,7 @@ app.post('/process', async (req, res) => {
     await browser.close();
 
     if (!mp4Url) {
-      return res.status(500).json({
-        error: 'MP4 não encontrado.',
-        logged_in: loggedIn,
-        api_responses: allResponses.length,
-        debug: allResponses.slice(0, 3)
-      });
+      return res.status(500).json({ error: 'Não foi possível extrair o vídeo. Verifique os cookies.' });
     }
 
     res.json({ downloadUrl: mp4Url });
